@@ -1,0 +1,16 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.local
+.git/
+.gitignore
+schema_snapshot.json
+*.log
+README.md

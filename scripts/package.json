@@ -1,0 +1,16 @@
+{
+  "name": "leaflet-db-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Dev utilities for Leaflet DB — schema dump and ad-hoc SQL application",
+  "scripts": {
+    "schema": "node db.js schema",
+    "update": "node db.js update",
+    "update:dry": "node db.js update --dry"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "pg": "^8.11.0"
+  }
+}

@@ -1,0 +1,45 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+.Python
+
+# ─── Virtualenvs ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Build & dist ────────────────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+
+# ─── Test / coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sw?
+.DS_Store
+
+# ─── Runtime generated ───────────────────────────────────────────────────────
+schema_snapshot.json
+*.log
+
+# ─── scripts/ dev utilities (Node.js deps, not part of Python app) ───────────
+scripts/node_modules/
+scripts/package-lock.json
