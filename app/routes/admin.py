@@ -1,12 +1,11 @@
-from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.dependencies import get_db_pool, require_role
+from app.dependencies import get_db_pool, invalidate_role_cache, require_role
 from app.models.admin import ArchiveUpdate, ApprovalUpdate, RoleUpdate, StatsResponse
 from app.models.book import RequestStatusUpdate
 
@@ -75,6 +74,7 @@ async def update_user_role(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="User not found")
+    invalidate_role_cache(target_id)
     return dict(updated)
 
 
@@ -99,6 +99,7 @@ async def update_user_approval(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="User not found")
+    invalidate_role_cache(target_id)
     return dict(updated)
 
 
@@ -194,12 +195,112 @@ async def list_all_loans(
 ) -> List[Dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT id, book_id, lender_id, borrower_id, status, loaned_at, due_date, returned_at, notes
-        FROM book_loans
-        ORDER BY loaned_at DESC
+        SELECT bl.id, bl.book_id, bl.lender_id, bl.borrower_id,
+               bl.status, bl.loaned_at, bl.due_date, bl.returned_at, bl.notes,
+               c.title, c.author,
+               b.book_source, b.library_id,
+               l.name AS library_name, l.location AS library_location
+        FROM book_loans bl
+        JOIN books b ON bl.book_id = b.id
+        JOIN books_catalog c ON b.catalog_id = c.id
+        LEFT JOIN libraries l ON b.library_id = l.id
+        ORDER BY bl.loaned_at DESC
         """
     )
     return [dict(r) for r in rows]
+
+
+@router.get("/logs")
+async def get_request_logs(
+    user: Dict[str, Any] = Depends(require_role("super_admin")),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    method: Optional[str] = Query(None),
+    path: Optional[str] = Query(None),
+    status_gte: Optional[int] = Query(None),
+    status_lte: Optional[int] = Query(None),
+    user_id: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    conditions = ["1=1"]
+    params: List[Any] = []
+
+    def _p(val: Any) -> str:
+        params.append(val)
+        return f"${len(params)}"
+
+    if method:
+        conditions.append(f"method = {_p(method.upper())}")
+    if path:
+        conditions.append(f"path ILIKE {_p('%' + path + '%')}")
+    if status_gte is not None:
+        conditions.append(f"status_code >= {_p(status_gte)}")
+    if status_lte is not None:
+        conditions.append(f"status_code <= {_p(status_lte)}")
+    if user_id:
+        conditions.append(f"rl.user_id = {_p(user_id)}::uuid")
+
+    where = " AND ".join(conditions)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT rl.id, rl.method, rl.path, rl.status_code,
+               ROUND(rl.duration_ms::numeric, 2) AS duration_ms,
+               rl.user_id, p.username, rl.ip_address, rl.created_at
+        FROM public.request_logs rl
+        LEFT JOIN public.profiles p ON p.id = rl.user_id
+        WHERE {where}
+        ORDER BY rl.created_at DESC
+        LIMIT {_p(limit)} OFFSET {_p(offset)}
+        """,
+        *params,
+    )
+
+    count_params: List[Any] = params[: len(params) - 2]
+    total = await pool.fetchval(
+        f"SELECT COUNT(*) FROM public.request_logs rl WHERE {where}",
+        *count_params,
+    )
+
+    return {"total": total, "logs": [dict(r) for r in rows]}
+
+
+@router.get("/logs/stats")
+async def get_request_log_stats(
+    user: Dict[str, Any] = Depends(require_role("super_admin")),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> Dict[str, Any]:
+    row = await pool.fetchrow(
+        """
+        SELECT
+            COUNT(*)                                                           AS total,
+            COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')    AS last_hour,
+            COUNT(*) FILTER (WHERE status_code >= 500)                         AS errors_total,
+            COUNT(*) FILTER (WHERE status_code >= 500
+                              AND  created_at > NOW() - INTERVAL '1 hour')    AS errors_last_hour,
+            ROUND(AVG(duration_ms)::numeric, 2)                               AS avg_duration_ms,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP
+                  (ORDER BY duration_ms)::numeric, 2)                         AS p95_duration_ms
+        FROM public.request_logs
+        """
+    )
+
+    top_paths = await pool.fetch(
+        """
+        SELECT path, COUNT(*) AS count,
+               ROUND(AVG(duration_ms)::numeric, 2) AS avg_ms
+        FROM public.request_logs
+        WHERE created_at > NOW() - INTERVAL '1 hour'
+        GROUP BY path
+        ORDER BY count DESC
+        LIMIT 10
+        """
+    )
+
+    return {
+        **dict(row),
+        "top_paths": [dict(r) for r in top_paths],
+    }
 
 
 @router.post("/loans/{loan_id}/complete")
@@ -210,13 +311,19 @@ async def admin_complete_loan(
 ) -> Dict[str, Any]:
     async with pool.acquire() as conn:
         async with conn.transaction():
+            loan = await conn.fetchrow(
+                "SELECT id, book_id, lender_id, borrower_id, status, loaned_at, returned_at FROM book_loans WHERE id = $1 FOR UPDATE",
+                loan_id,
+            )
+            if not loan:
+                raise HTTPException(status_code=404, detail="Loan not found")
+            if loan["status"] == "returned":
+                return dict(loan)
             updated = await conn.fetchrow(
                 "UPDATE book_loans SET status = 'returned', returned_at = NOW() WHERE id = $1 "
                 "RETURNING id, book_id, lender_id, borrower_id, status, returned_at",
                 loan_id,
             )
-            if not updated:
-                raise HTTPException(status_code=404, detail="Loan not found")
             await conn.execute(
                 "UPDATE books SET status = 'available' WHERE id = $1",
                 str(updated["book_id"]),
