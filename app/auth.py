@@ -38,14 +38,11 @@ async def verify_with_jwks(token: str) -> Dict[str, Any]:
     kid = header.get("kid")
     alg = header.get("alg", "RS256")
 
-    key = None
-    for k in jwks.get("keys", []):
-        if kid and k.get("kid") == kid:
-            key = k
-            break
-        elif not kid:
-            key = k
-            break
+    keys = jwks.get("keys", [])
+    if kid:
+        key = next((k for k in keys if k.get("kid") == kid), None)
+    else:
+        key = next(iter(keys), None)
 
     if key is None:
         raise JWTError("No matching key found in JWKS")

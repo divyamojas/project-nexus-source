@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
@@ -137,7 +136,10 @@ async def update_request_status(
     async with pool.acquire() as conn:
         async with conn.transaction():
             req = await conn.fetchrow(
-                "SELECT id, book_id, requested_by, requested_to, status FROM book_requests WHERE id = $1 FOR UPDATE",
+                """
+                SELECT id, book_id, requested_by, requested_to, status, message, created_at, updated_at
+                FROM book_requests WHERE id = $1 FOR UPDATE
+                """,
                 request_id,
             )
             if not req:
@@ -150,8 +152,24 @@ async def update_request_status(
                 if req["requested_to"] != user["id"]:
                     raise HTTPException(status_code=404, detail="Request not found")
 
+            if req["status"] == body.status:
+                return dict(req)
+
             if req["status"] != "pending":
                 raise HTTPException(status_code=409, detail="Request is no longer pending")
+
+            if body.status == "accepted":
+                book = await conn.fetchrow(
+                    """
+                    SELECT b.id, b.status, b.book_source, l.is_self_service
+                    FROM books b
+                    LEFT JOIN libraries l ON b.library_id = l.id
+                    WHERE b.id = $1 FOR UPDATE OF b
+                    """,
+                    str(req["book_id"]),
+                )
+                if not book or book["status"] != "available":
+                    raise HTTPException(status_code=409, detail="Book is no longer available")
 
             updated = await conn.fetchrow(
                 """
@@ -164,20 +182,40 @@ async def update_request_status(
             )
 
             if body.status == "accepted":
-                await conn.execute(
-                    "UPDATE books SET status = 'scheduled' WHERE id = $1",
-                    str(req["book_id"]),
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO transfers (request_id, book_id, from_user, to_user, status)
-                    VALUES ($1, $2, $3, $4, 'pending')
-                    ON CONFLICT (book_id, from_user, to_user) DO NOTHING
-                    """,
-                    request_id,
-                    str(req["book_id"]),
-                    str(req["requested_to"]),
-                    str(req["requested_by"]),
-                )
+                if book["book_source"] == "library" and not book["is_self_service"]:
+                    # Admin-managed library: create loan directly, no transfer step
+                    await conn.execute(
+                        "UPDATE books SET status = 'lent' WHERE id = $1",
+                        str(req["book_id"]),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO book_loans (book_id, lender_id, borrower_id, status)
+                        VALUES ($1, $2, $3, 'active')
+                        """,
+                        str(req["book_id"]),
+                        str(req["requested_to"]),
+                        str(req["requested_by"]),
+                    )
+                elif book["book_source"] == "library" and book["is_self_service"]:
+                    # Self-service library: loan is created at pickup; nothing to do here
+                    pass
+                else:
+                    # Personal P2P: standard transfer flow
+                    await conn.execute(
+                        "UPDATE books SET status = 'scheduled' WHERE id = $1",
+                        str(req["book_id"]),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO transfers (request_id, book_id, from_user, to_user, status)
+                        VALUES ($1, $2, $3, $4, 'pending')
+                        ON CONFLICT (book_id, from_user, to_user) DO NOTHING
+                        """,
+                        request_id,
+                        str(req["book_id"]),
+                        str(req["requested_to"]),
+                        str(req["requested_by"]),
+                    )
 
     return dict(updated)

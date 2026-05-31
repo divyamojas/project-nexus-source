@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
@@ -38,10 +37,6 @@ async def create_book_review(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> Dict[str, Any]:
-    book = await pool.fetchrow("SELECT id FROM books WHERE id = $1", str(body.book_id))
-    if not book:
-        raise HTTPException(status_code=404, detail="Book not found")
-
     try:
         row = await pool.fetchrow(
             """
@@ -56,6 +51,8 @@ async def create_book_review(
         )
     except asyncpg.UniqueViolationError:
         raise HTTPException(status_code=409, detail="You have already reviewed this book")
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(status_code=404, detail="Book not found")
 
     return dict(row)
 

@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
@@ -22,10 +21,13 @@ async def list_loans(
         """
         SELECT bl.id, bl.book_id, bl.lender_id, bl.borrower_id,
                bl.status, bl.loaned_at, bl.due_date, bl.returned_at, bl.notes,
-               c.title, c.author, c.cover_url
+               c.title, c.author, c.cover_url,
+               b.book_source, b.library_id,
+               l.name AS library_name, l.location AS library_location
         FROM book_loans bl
         JOIN books b ON bl.book_id = b.id
         JOIN books_catalog c ON b.catalog_id = c.id
+        LEFT JOIN libraries l ON b.library_id = l.id
         WHERE bl.lender_id = $1 OR bl.borrower_id = $1
         ORDER BY bl.loaned_at DESC
         """,
@@ -60,23 +62,35 @@ async def return_loan(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> Dict[str, Any]:
-    loan = await pool.fetchrow(
-        "SELECT id, lender_id, borrower_id, status FROM book_loans WHERE id = $1",
-        loan_id,
-    )
-    if not loan:
-        raise HTTPException(status_code=404, detail="Loan not found")
-    if loan["lender_id"] != user["id"] and loan["borrower_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="Loan not found")
-    if loan["status"] != "active":
-        raise HTTPException(status_code=409, detail="Loan is not active")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            loan = await conn.fetchrow(
+                "SELECT id, book_id, lender_id, borrower_id, status FROM book_loans WHERE id = $1 FOR UPDATE",
+                loan_id,
+            )
+            if not loan:
+                raise HTTPException(status_code=404, detail="Loan not found")
+            if loan["lender_id"] != user["id"] and loan["borrower_id"] != user["id"]:
+                raise HTTPException(status_code=404, detail="Loan not found")
+            if loan["status"] == "returned":
+                existing = await conn.fetchrow(
+                    "SELECT id, book_id, lender_id, borrower_id, status, loaned_at, returned_at FROM book_loans WHERE id = $1",
+                    loan_id,
+                )
+                return dict(existing)
+            if loan["status"] != "active":
+                raise HTTPException(status_code=409, detail="Loan is not active")
 
-    updated = await pool.fetchrow(
-        """
-        UPDATE book_loans SET status = 'returned', returned_at = NOW()
-        WHERE id = $1
-        RETURNING id, book_id, lender_id, borrower_id, status, loaned_at, returned_at
-        """,
-        loan_id,
-    )
+            updated = await conn.fetchrow(
+                """
+                UPDATE book_loans SET status = 'returned', returned_at = NOW()
+                WHERE id = $1
+                RETURNING id, book_id, lender_id, borrower_id, status, loaned_at, returned_at
+                """,
+                loan_id,
+            )
+            await conn.execute(
+                "UPDATE books SET status = 'available' WHERE id = $1",
+                str(loan["book_id"]),
+            )
     return dict(updated)

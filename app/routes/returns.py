@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict
@@ -35,6 +34,24 @@ async def create_return_request(
     if loan["borrower_id"] != user["id"] and loan["lender_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="No active loan found for this book")
 
+    # Library books: one-click return — no approval step needed
+    book_source = await pool.fetchval(
+        "SELECT book_source FROM books WHERE id = $1",
+        str(loan["book_id"]),
+    )
+    if book_source == "library":
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE book_loans SET status = 'returned', returned_at = NOW() WHERE id = $1",
+                    str(loan["id"]),
+                )
+                await conn.execute(
+                    "UPDATE books SET status = 'available' WHERE id = $1",
+                    str(loan["book_id"]),
+                )
+        return {"message": "Book returned to library", "loan_id": str(loan["id"])}
+
     try:
         row = await pool.fetchrow(
             """
@@ -47,7 +64,15 @@ async def create_return_request(
             user["id"],
         )
     except asyncpg.UniqueViolationError:
-        raise HTTPException(status_code=409, detail="A pending return request already exists for this loan")
+        existing = await pool.fetchrow(
+            """
+            SELECT id, book_id, loan_id, requested_by, status, requested_at
+            FROM return_requests
+            WHERE loan_id = $1 AND status = 'pending'
+            """,
+            str(loan["id"]),
+        )
+        return dict(existing)
 
     return dict(row)
 
@@ -62,7 +87,7 @@ async def approve_return(
         async with conn.transaction():
             ret = await conn.fetchrow(
                 """
-                SELECT rr.id, rr.book_id, rr.loan_id, rr.status,
+                SELECT rr.id, rr.book_id, rr.loan_id, rr.status, rr.resolved_at,
                        bl.lender_id, bl.borrower_id
                 FROM return_requests rr
                 JOIN book_loans bl ON rr.loan_id = bl.id
@@ -75,6 +100,9 @@ async def approve_return(
                 raise HTTPException(status_code=404, detail="Return request not found")
             if ret["lender_id"] != user["id"]:
                 raise HTTPException(status_code=404, detail="Return request not found")
+            if ret["status"] == "approved":
+                return {"id": ret["id"], "book_id": ret["book_id"], "loan_id": ret["loan_id"],
+                        "status": ret["status"], "resolved_at": ret["resolved_at"]}
             if ret["status"] != "pending":
                 raise HTTPException(status_code=409, detail="Return request is no longer pending")
 

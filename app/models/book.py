@@ -59,3 +59,15 @@ class ProfileUpdate(BaseModel):
     last_name: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
+
+
+class LibraryCreate(BaseModel):
+    name: str
+    city: str
+    location: str
+    is_self_service: bool = False
+
+
+class LibraryBookAdd(BaseModel):
+    catalog_id: UUID
+    condition: str

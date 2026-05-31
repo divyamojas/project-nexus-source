@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,13 +11,14 @@ from slowapi.errors import RateLimitExceeded
 from supabase import create_client
 
 from app.limiter import limiter
+from app.request_logging import RequestLoggingMiddleware
 
 from app.config import settings
 from app.db import (
     apply_pending_migrations,
     create_pool,
     ensure_migrations_table,
-    take_schema_snapshot,
+    refresh_and_persist_snapshot,
 )
 from app.routes import (
     admin,
@@ -26,6 +27,7 @@ from app.routes import (
     catalog,
     feedback,
     legal,
+    library,
     loans,
     requests,
     returns,
@@ -58,7 +60,7 @@ async def lifespan(app: FastAPI):
         logger.warning("DB unavailable: %s — starting in degraded mode", exc)
         app.state.db_pool = None
 
-    # 3–5. Migrations + schema snapshot
+    # 3–4. Migrations (blocking — must finish before serving requests)
     app.state.schema_snapshot = None
     if app.state.db_pool:
         try:
@@ -68,14 +70,15 @@ async def lifespan(app: FastAPI):
             applied = await apply_pending_migrations(app.state.db_pool)
             if applied:
                 logger.info("Applied migrations: %s", applied)
-
-            snapshot = await take_schema_snapshot(app.state.db_pool)
-            app.state.schema_snapshot = snapshot
-            with open("schema_snapshot.json", "w") as fh:
-                json.dump(snapshot, fh, indent=2, default=str)
-            logger.info("Schema snapshot written")
         except Exception as exc:
-            logger.warning("Startup DB task failed: %s", exc)
+            logger.warning("Startup migrations failed: %s", exc)
+
+        # 5. Schema snapshot — fire-and-forget so it never delays startup
+        async def _snapshot_task():
+            await refresh_and_persist_snapshot(app.state, app.state.db_pool)
+            logger.info("Schema snapshot written")
+
+        asyncio.create_task(_snapshot_task())
 
     yield
 
@@ -95,6 +98,7 @@ def create_app() -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
@@ -106,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(books.router)
     app.include_router(catalog.router)
+    app.include_router(library.router)
     app.include_router(requests.router)
     app.include_router(loans.router)
     app.include_router(transfers.router)

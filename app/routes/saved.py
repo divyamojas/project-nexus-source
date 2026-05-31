@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
@@ -49,13 +48,6 @@ async def save_book(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> Dict[str, Any]:
-    book = await pool.fetchrow(
-        "SELECT id FROM books WHERE id = $1",
-        str(body.book_id),
-    )
-    if not book:
-        raise HTTPException(status_code=404, detail="Book not found")
-
     try:
         row = await pool.fetchrow(
             """
@@ -68,7 +60,14 @@ async def save_book(
             str(body.catalog_id),
         )
     except asyncpg.UniqueViolationError:
-        raise HTTPException(status_code=409, detail="Book already saved")
+        existing = await pool.fetchrow(
+            "SELECT id, user_id, book_id, catalog_id, created_at FROM saved_books WHERE user_id = $1 AND book_id = $2",
+            user["id"],
+            str(body.book_id),
+        )
+        return dict(existing)
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(status_code=404, detail="Book not found")
 
     return dict(row)
 

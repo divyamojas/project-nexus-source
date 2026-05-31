@@ -1,10 +1,9 @@
-from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.dependencies import get_db_pool, require_role
 from app.models.admin import ArchiveUpdate
@@ -23,6 +22,12 @@ def _shape(row: dict) -> dict:
         "condition": row["condition"],
         "archived": row["archived"],
         "created_at": row["created_at"],
+        "book_source": row["book_source"],
+        "library_id": row["library_id"],
+        "library_name": row["library_name"],
+        "library_location": row["library_location"],
+        "library_city": row["library_city"],
+        "library_is_self_service": row["library_is_self_service"],
         "catalog": {
             "id": row["catalog_id"],
             "title": row["title"],
@@ -41,6 +46,11 @@ def _shape(row: dict) -> dict:
 ENRICHED_BOOKS_SQL = """
 SELECT
   b.id, b.status, b.condition, b.created_at, b.user_id, b.archived,
+  b.book_source, b.library_id,
+  l.name     AS library_name,
+  l.location AS library_location,
+  l.city     AS library_city,
+  l.is_self_service AS library_is_self_service,
   c.id AS catalog_id, c.title, c.author, c.cover_url, c.isbn,
   EXISTS(
     SELECT 1 FROM saved_books sb
@@ -56,6 +66,7 @@ SELECT
   _br.id     AS request_id
 FROM books b
 JOIN books_catalog c ON b.catalog_id = c.id
+LEFT JOIN libraries l ON b.library_id = l.id
 LEFT JOIN LATERAL (
   SELECT id, status FROM book_requests
   WHERE book_id = b.id AND requested_by = $1 AND status = 'pending'
@@ -68,8 +79,16 @@ LEFT JOIN LATERAL (
 async def list_books(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
+    source: Optional[str] = Query(None, pattern="^(personal|library|all)$"),
 ) -> List[Dict[str, Any]]:
-    rows = await pool.fetch(ENRICHED_BOOKS_SQL + " ORDER BY b.created_at DESC", user["id"])
+    if source and source != "all":
+        rows = await pool.fetch(
+            ENRICHED_BOOKS_SQL + " WHERE b.book_source = $2 ORDER BY b.created_at DESC",
+            user["id"],
+            source,
+        )
+    else:
+        rows = await pool.fetch(ENRICHED_BOOKS_SQL + " ORDER BY b.created_at DESC", user["id"])
     return [_shape(dict(r)) for r in rows]
 
 
@@ -91,10 +110,13 @@ async def create_book(
             body.condition,
         )
     except asyncpg.UniqueViolationError:
-        raise HTTPException(
-            status_code=409,
-            detail="You already have this book with the same condition listed.",
+        existing = await pool.fetchrow(
+            "SELECT id, user_id, catalog_id, condition, status, archived, created_at FROM books WHERE user_id = $1 AND catalog_id = $2 AND condition = $3",
+            user["id"],
+            str(body.catalog_id),
+            body.condition,
         )
+        return dict(existing)
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(status_code=404, detail="Catalog entry not found")
 
@@ -123,13 +145,11 @@ async def delete_book(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> Dict[str, str]:
-    deleted = await pool.fetchrow(
-        "DELETE FROM books WHERE id = $1 AND user_id = $2 RETURNING id",
+    await pool.execute(
+        "DELETE FROM books WHERE id = $1 AND user_id = $2",
         book_id,
         user["id"],
     )
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Book not found")
     return {"message": "Book deleted"}
 
 

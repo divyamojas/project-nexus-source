@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
@@ -86,7 +85,7 @@ async def complete_transfer(
     async with pool.acquire() as conn:
         async with conn.transaction():
             transfer = await conn.fetchrow(
-                "SELECT id, book_id, from_user, to_user, status FROM transfers WHERE id = $1 FOR UPDATE",
+                "SELECT id, book_id, from_user, to_user, status, completed_at FROM transfers WHERE id = $1 FOR UPDATE",
                 transfer_id,
             )
             if not transfer:
@@ -94,7 +93,18 @@ async def complete_transfer(
             if transfer["from_user"] != user["id"] and transfer["to_user"] != user["id"]:
                 raise HTTPException(status_code=404, detail="Transfer not found")
             if transfer["status"] == "transferred":
-                raise HTTPException(status_code=409, detail="Transfer already completed")
+                loan = await conn.fetchrow(
+                    """
+                    SELECT id, book_id, lender_id, borrower_id, status, loaned_at
+                    FROM book_loans
+                    WHERE book_id = $1 AND lender_id = $2 AND borrower_id = $3
+                    ORDER BY loaned_at DESC LIMIT 1
+                    """,
+                    str(transfer["book_id"]),
+                    str(transfer["from_user"]),
+                    str(transfer["to_user"]),
+                )
+                return {**dict(transfer), "loan": dict(loan) if loan else {}}
 
             updated_transfer = await conn.fetchrow(
                 """
