@@ -84,15 +84,20 @@ async def create_user_review(
     if str(body.reviewee_id) == user["id"]:
         raise HTTPException(status_code=400, detail="Cannot review yourself")
 
-    row = await pool.fetchrow(
-        """
-        INSERT INTO user_reviews (reviewee_id, reviewer_id, rating, comment)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, reviewee_id, reviewer_id, rating, comment, created_at
-        """,
-        str(body.reviewee_id),
-        user["id"],
-        body.rating,
-        body.comment,
-    )
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO user_reviews (reviewee_id, reviewer_id, rating, comment)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, reviewee_id, reviewer_id, rating, comment, created_at
+            """,
+            str(body.reviewee_id),
+            user["id"],
+            body.rating,
+            body.comment,
+        )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail="You have already reviewed this user")
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
