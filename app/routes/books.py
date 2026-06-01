@@ -80,15 +80,33 @@ async def list_books(
     user: Dict[str, Any] = Depends(require_role("user")),
     pool: asyncpg.Pool = Depends(get_db_pool),
     source: Optional[str] = Query(None, pattern="^(personal|library|all)$"),
+    search: Optional[str] = Query(None, max_length=200),
+    status: Optional[str] = Query(None, pattern="^(available|scheduled|lent)$"),
+    archived: Optional[bool] = Query(None),
 ) -> List[Dict[str, Any]]:
+    # $1 is always user_id — it is referenced inside ENRICHED_BOOKS_SQL subqueries
+    conditions: List[str] = []
+    params: List[Any] = [user["id"]]
+
     if source and source != "all":
-        rows = await pool.fetch(
-            ENRICHED_BOOKS_SQL + " WHERE b.book_source = $2 ORDER BY b.created_at DESC",
-            user["id"],
-            source,
-        )
-    else:
-        rows = await pool.fetch(ENRICHED_BOOKS_SQL + " ORDER BY b.created_at DESC", user["id"])
+        params.append(source)
+        conditions.append(f"b.book_source = ${len(params)}")
+    if status:
+        params.append(status)
+        conditions.append(f"b.status = ${len(params)}")
+    if archived is not None:
+        params.append(archived)
+        conditions.append(f"b.archived = ${len(params)}")
+    if search:
+        params.append(f"%{search.lower()}%")
+        n = len(params)
+        conditions.append(f"(LOWER(c.title) LIKE ${n} OR LOWER(c.author) LIKE ${n})")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = await pool.fetch(
+        ENRICHED_BOOKS_SQL + f" {where} ORDER BY b.created_at DESC",
+        *params,
+    )
     return [_shape(dict(r)) for r in rows]
 
 
