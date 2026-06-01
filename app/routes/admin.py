@@ -246,7 +246,9 @@ async def get_request_logs(
         f"""
         SELECT rl.id, rl.method, rl.path, rl.status_code,
                ROUND(rl.duration_ms::numeric, 2) AS duration_ms,
-               rl.user_id, p.username, rl.ip_address, rl.created_at
+               rl.user_id, p.username, rl.ip_address, rl.created_at,
+               rl.query_params, rl.request_body, rl.error_detail,
+               rl.user_agent, rl.request_id
         FROM public.request_logs rl
         LEFT JOIN public.profiles p ON p.id = rl.user_id
         WHERE {where}
@@ -262,7 +264,65 @@ async def get_request_logs(
         *count_params,
     )
 
-    return {"total": total, "logs": [dict(r) for r in rows]}
+    def _row(r):
+        d = dict(r)
+        # asyncpg returns JSONB as strings; parse them so the API sends real JSON
+        for col in ("query_params", "request_body", "error_detail"):
+            if isinstance(d.get(col), str):
+                import json as _j
+                try:
+                    d[col] = _j.loads(d[col])
+                except Exception:
+                    pass
+        return d
+
+    return {"total": total, "logs": [_row(r) for r in rows]}
+
+
+@router.delete("/logs")
+async def delete_request_logs(
+    user: Dict[str, Any] = Depends(require_role("super_admin")),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    ids: Optional[str] = Query(None, description="Comma-separated log IDs; omit to delete by filter or all"),
+    method: Optional[str] = Query(None),
+    path: Optional[str] = Query(None),
+    status_gte: Optional[int] = Query(None),
+    status_lte: Optional[int] = Query(None),
+    user_id: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Delete log rows by explicit IDs, or by filter (all matching), or clear the entire table."""
+    if ids:
+        id_list = [int(i.strip()) for i in ids.split(",") if i.strip().isdigit()]
+        if not id_list:
+            raise HTTPException(status_code=400, detail="No valid IDs provided")
+        deleted = await pool.fetchval(
+            "WITH d AS (DELETE FROM public.request_logs WHERE id = ANY($1::bigint[]) RETURNING 1) SELECT COUNT(*) FROM d",
+            id_list,
+        )
+    else:
+        conditions = ["1=1"]
+        params: List[Any] = []
+
+        def _p(val: Any) -> str:
+            params.append(val)
+            return f"${len(params)}"
+
+        if method:
+            conditions.append(f"method = {_p(method.upper())}")
+        if path:
+            conditions.append(f"path ILIKE {_p('%' + path + '%')}")
+        if status_gte is not None:
+            conditions.append(f"status_code >= {_p(status_gte)}")
+        if status_lte is not None:
+            conditions.append(f"status_code <= {_p(status_lte)}")
+        if user_id:
+            conditions.append(f"user_id = {_p(user_id)}::uuid")
+        where = " AND ".join(conditions)
+        deleted = await pool.fetchval(
+            f"WITH d AS (DELETE FROM public.request_logs WHERE {where} RETURNING 1) SELECT COUNT(*) FROM d",
+            *params,
+        )
+    return {"deleted": deleted}
 
 
 @router.get("/logs/stats")
